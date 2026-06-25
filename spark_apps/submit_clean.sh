@@ -11,6 +11,16 @@
 #
 set -euo pipefail
 
+# --- Make the script self-sufficient over SSH ---------------------------------
+# An SSH non-interactive session does NOT inherit the container's docker ENV
+# (sshd resets the environment), so set JAVA_HOME / SPARK_HOME / PATH here.
+export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
+export SPARK_HOME="${SPARK_HOME:-/usr/local/lib/python3.11/site-packages/pyspark}"
+export PATH="${SPARK_HOME}/bin:${JAVA_HOME}/bin:${PATH}"
+# Ivy/Spark need a writable home for the --packages cache and tmp dirs.
+export HOME="${HOME:-/tmp}"
+# -----------------------------------------------------------------------------
+
 # Path to the synced repo inside spark_client (git-sync mounts the volume here).
 APP_DIR="${APP_DIR:-/opt/dataops/repo/spark_apps}"
 APP="${APP_DIR}/clean_store_transactions.py"

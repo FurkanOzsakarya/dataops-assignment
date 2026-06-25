@@ -25,10 +25,13 @@ RUN pip install --no-cache-dir \
         pandas==2.2.2 \
         boto3==1.34.131
 
-# Put spark-submit / spark-shell on PATH (provided by the pyspark wheel)
-RUN PYSPARK_HOME="$(python -c 'import pyspark, os; print(os.path.dirname(pyspark.__file__))')" \
-    && ln -s "${PYSPARK_HOME}/bin/spark-submit" /usr/local/bin/spark-submit \
-    && ln -s "${PYSPARK_HOME}/bin/spark-shell"  /usr/local/bin/spark-shell
+# Put spark-submit / spark-shell on PATH (provided by the pyspark wheel).
+# In the python:3.11-bullseye image, pip installs to this fixed site-packages path.
+ENV SPARK_HOME=/usr/local/lib/python3.11/site-packages/pyspark
+ENV PATH="${SPARK_HOME}/bin:${PATH}"
+
+# Verify spark-submit is present (build fails loudly otherwise)
+RUN ls -la "${SPARK_HOME}/bin/spark-submit" && spark-submit --version 2>/dev/null | head -1 || true
 
 # Pre-create the SSH runtime dir
 RUN mkdir -p /var/run/sshd
