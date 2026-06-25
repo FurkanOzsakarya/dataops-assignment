@@ -1,0 +1,217 @@
+# =============================================================================
+# DataOps Assignment - single-environment stack
+#   - rustfs        : S3-compatible object storage (bronze bucket)
+#   - postgres      : data sink (traindb)
+#   - airflow-db    : Airflow 3 metadata DB
+#   - git-sync      : CI -> pulls repo (dags + spark_apps) into a shared volume
+#   - airflow-*     : Airflow 3 (apiserver, scheduler, dag-processor, triggerer)
+#   - spark_client  : Spark + SSH; runs the PySpark job (target of SSHOperator)
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.0.2
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /git/repo/dags
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAG_FILE_PROCESSOR_TIMEOUT: "120"
+    AIRFLOW__API__SECRET_KEY: "dataops-secret-key-change-me"
+    AIRFLOW__API_AUTH__JWT_SECRET: "dataops-jwt-secret-change-me"
+    # SSH connection to the spark_client container (no manual UI step needed)
+    AIRFLOW_CONN_SPARK_SSH: "ssh://${SPARK_SSH_USER:-train}:${SPARK_SSH_PASSWORD:-Ankara06}@spark_client:22?no_host_key_check=true"
+    # Make the cleaning job's config available to Airflow tasks if needed
+    _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-ssh==4.0.1"
+  volumes:
+    - dataops-repo:/git:ro
+    - airflow-logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+    git-sync:
+      condition: service_started
+
+services:
+  # ---------------------------------------------------------------------------
+  # RustFS - S3-compatible object storage
+  # ---------------------------------------------------------------------------
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - rustfs-data:/data
+    command: ["/data"]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL - data sink (traindb)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-traindb}
+      POSTGRES_USER: ${POSTGRES_USER:-train}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Ankara06}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-train} -d ${POSTGRES_DB:-traindb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Airflow metadata database
+  # ---------------------------------------------------------------------------
+  airflow-db:
+    image: postgres:16
+    container_name: airflow-db
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # git-sync - Continuous Integration: pull repo (dags + spark_apps)
+  # Produces /git/repo  ->  <synced worktree>
+  # ---------------------------------------------------------------------------
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.2.0
+    container_name: git-sync
+    environment:
+      GITSYNC_REPO: ${GITSYNC_REPO}
+      GITSYNC_REF: ${GITSYNC_REF:-main}
+      GITSYNC_ROOT: /git
+      GITSYNC_LINK: repo
+      GITSYNC_PERIOD: 30s
+      GITSYNC_ONE_TIME: "false"
+      GITSYNC_USERNAME: ${GITSYNC_USERNAME:-}
+      GITSYNC_PASSWORD: ${GITSYNC_PASSWORD:-}
+    volumes:
+      - dataops-repo:/git
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Airflow init - db migrate + create admin user
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Data --lastname Ops \
+          --role Admin --email admin@example.com || true
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # spark_client - runs the PySpark job; target of the Airflow SSHOperator.
+  # The application code arrives here via git-sync (shared volume), NOT by hand.
+  # ---------------------------------------------------------------------------
+  spark_client:
+    build:
+      context: ./docker/spark_client
+    image: dataops/spark-client:latest
+    container_name: spark_client
+    environment:
+      SPARK_SSH_USER: ${SPARK_SSH_USER:-train}
+      SPARK_SSH_PASSWORD: ${SPARK_SSH_PASSWORD:-Ankara06}
+      S3_ENDPOINT_URL: http://rustfs:9000
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      BRONZE_BUCKET: ${BRONZE_BUCKET:-dataops-bronze}
+      RAW_OBJECT_KEY: ${RAW_OBJECT_KEY:-raw/dirty_store_transactions.csv}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-traindb}
+      POSTGRES_USER: ${POSTGRES_USER:-train}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Ankara06}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
+      TARGET_TABLE: ${TARGET_TABLE:-clean_data_transactions}
+    ports:
+      - "2222:22"
+    volumes:
+      # Same synced repo that Airflow uses -> /opt/dataops/repo/spark_apps/...
+      - dataops-repo:/opt/dataops:ro
+    depends_on:
+      - rustfs
+      - postgres
+      - git-sync
+    restart: unless-stopped
+
+volumes:
+  dataops-repo:
+  rustfs-data:
+  postgres-data:
+  airflow-db-data:
+  airflow-logs:

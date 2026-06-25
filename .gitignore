@@ -1,0 +1,17 @@
+# Secrets / local config
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Spark / local test output
+spark-warehouse/
+out_local/
+*.crc
+_SUCCESS
+
+# OS
+.DS_Store

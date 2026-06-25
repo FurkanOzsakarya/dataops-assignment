@@ -1,0 +1,47 @@
+# Continuous Deployment trigger.
+# When code is merged into `main`, git-sync deploys the new DAG/Spark code to the
+# Airflow & spark_client containers (CI). This workflow then asks Airflow to
+# EXECUTE the pipeline (CD) via the Airflow 3 REST API.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   AIRFLOW_BASE_URL   e.g. https://<your-public-airflow-host>   (no trailing /)
+#   AIRFLOW_USERNAME   default: admin
+#   AIRFLOW_PASSWORD   default: admin
+#
+# NOTE: GitHub-hosted runners must be able to REACH your Airflow API server.
+# For a laptop/local stack, expose port 8080 with a tunnel (ngrok / cloudflared)
+# and put that public URL in AIRFLOW_BASE_URL. See README "Manual steps".
+
+name: Trigger Airflow on merge to main
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Airflow DAG run (Airflow 3 REST API)
+        env:
+          BASE_URL: ${{ secrets.AIRFLOW_BASE_URL }}
+          AF_USER: ${{ secrets.AIRFLOW_USERNAME }}
+          AF_PASS: ${{ secrets.AIRFLOW_PASSWORD }}
+          DAG_ID: store_transactions_clean_pipeline
+        run: |
+          set -euo pipefail
+
+          echo "Requesting JWT token from Airflow..."
+          TOKEN=$(curl -sf -X POST "${BASE_URL}/auth/token" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${AF_USER}\",\"password\":\"${AF_PASS}\"}" \
+            | python3 -c "import sys, json; print(json.load(sys.stdin)['access_token'])")
+
+          RUN_ID="github-$(date +%Y%m%dT%H%M%S)"
+          echo "Triggering DAG ${DAG_ID} (run_id=${RUN_ID})..."
+          curl -sf -X POST "${BASE_URL}/api/v2/dags/${DAG_ID}/dagRuns" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"dag_run_id\":\"${RUN_ID}\",\"logical_date\":null}"
+
+          echo "DAG run requested successfully."
