@@ -6,7 +6,7 @@
 #   3) Bu klasörde:  bash scripts/git_bootstrap.sh
 set -euo pipefail
 
-REMOTE="https://github.com/CHANGE_ME/dataops-assignment.git"
+REMOTE="https://github.com/FurkanOzsakarya/dataops-assignment.git"
 
 git init
 git add .
